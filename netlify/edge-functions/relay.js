@@ -1,6 +1,6 @@
-const TARGET_BASE = (Netlify.env.get("TAR") || "").replace(/\/$/, "");
+const BASE_URL = (Netlify.env.get("TAR") || "").replace(/\/$/, "");
 
-const STRIP_HEADERS = new Set([
+const BLOCKED = new Set([
   "host",
   "connection",
   "keep-alive",
@@ -16,62 +16,86 @@ const STRIP_HEADERS = new Set([
   "x-forwarded-port",
 ]);
 
-export default async function handler(request) {
-  if (!TARGET_BASE) {
-    return new Response("Misconfigured: TARGET_DOMAIN is not set", { status: 500 });
+export default async function relay(req) {
+  if (!BASE_URL) {
+    return new Response("Misconfigured: TARGET_DOMAIN is not set", {
+      status: 500,
+    });
   }
 
   try {
-    const url = new URL(request.url);
-    const targetUrl = TARGET_BASE + url.pathname + url.search;
+    const incoming = new URL(req.url);
+    const endpoint = `${BASE_URL}${incoming.pathname}${incoming.search}`;
 
-    const headers = new Headers();
-    let clientIp = null;
+    const outgoingHeaders = new Headers();
 
-    for (const [key, value] of request.headers) {
-      const k = key.toLowerCase();
-      if (STRIP_HEADERS.has(k)) continue;
-      if (k.startsWith("x-nf-")) continue;
-      if (k.startsWith("x-netlify-")) continue;
-      if (k === "x-real-ip") {
-        clientIp = value;
+    let ipAddress = null;
+
+    for (const entry of req.headers.entries()) {
+      const [headerName, headerValue] = entry;
+
+      const normalized = headerName.toLowerCase();
+
+      if (BLOCKED.has(normalized)) continue;
+
+      if (
+        normalized.startsWith("x-nf-") ||
+        normalized.startsWith("x-netlify-")
+      ) {
         continue;
       }
-      if (k === "x-forwarded-for") {
-        if (!clientIp) clientIp = value;
-        continue;
+
+      switch (normalized) {
+        case "x-real-ip":
+          ipAddress = headerValue;
+          break;
+
+        case "x-forwarded-for":
+          if (!ipAddress) {
+            ipAddress = headerValue;
+          }
+          break;
+
+        default:
+          outgoingHeaders.append(headerName, headerValue);
       }
-      headers.set(k, value);
     }
 
-    if (clientIp) headers.set("x-forwarded-for", clientIp);
+    if (ipAddress) {
+      outgoingHeaders.set("x-forwarded-for", ipAddress);
+    }
 
-    const method = request.method;
-    const hasBody = method !== "GET" && method !== "HEAD";
+    const sendBody =
+      req.method !== "GET" &&
+      req.method !== "HEAD";
 
-    const fetchOptions = {
-      method,
-      headers,
+    const init = {
+      method: req.method,
+      headers: outgoingHeaders,
       redirect: "manual",
     };
 
-    if (hasBody) {
-      fetchOptions.body = request.body;
+    if (sendBody) {
+      init.body = req.body;
     }
 
-    const upstream = await fetch(targetUrl, fetchOptions);
+    const result = await fetch(endpoint, init);
 
-    const responseHeaders = new Headers();
-    for (const [key, value] of upstream.headers) {
-      if (key.toLowerCase() === "transfer-encoding") continue;
-      responseHeaders.set(key, value);
+    const finalHeaders = new Headers();
+
+    for (const [k, v] of result.headers.entries()) {
+      if (k.toLowerCase() !== "transfer-encoding") {
+        finalHeaders.append(k, v);
+      }
     }
 
-    return new Response(upstream.body, {
-      status: upstream.status,
-      headers: responseHeaders,
+    return new Response(result.body, {
+      status: result.status,
+      headers: finalHeaders,
     });
-  } catch (error) {
-    return new Response("Bad Gateway: Relay Failed", { status: 502 });
+  } catch (_) {
+    return new Response("Bad Gateway: Relay Failed", {
+      status: 502,
+    });
   }
 }
